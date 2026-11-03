@@ -1,0 +1,799 @@
+#!/bin/bash
+#
+# xcode-update — an interactive, user-controlled Xcode updater built on `xcodes`.
+#
+# The update wizard walks through nine steps:
+#   1. Preflight       check xcodes, aria2 and free disk space
+#   2. Current state   refresh the version list, show what's installed and active
+#   3. Choose          latest release, latest beta, any other version, or nothing
+#   4. Install         download + install with xcodes (asks for options first)
+#   5. Make default    repoint the Xcode.app symlink or run xcode-select directly
+#   6. First launch    accept the license and install system components
+#   7. Clean up        offer to uninstall older Xcodes (all, one by one, or none)
+#   8. Runtimes        download or prune simulator runtimes
+#   9. Summary         show the final state
+#
+# Every step that changes something asks first and can be skipped.
+# Pass --dry-run to print each changing command without running it.
+#
+# Written for the macOS system bash (3.2): no associative arrays, no mapfile,
+# and possibly-empty arrays are never expanded while `set -u` is on.
+
+set -uo pipefail
+
+readonly SCRIPT_VERSION="1.0.0"
+
+# ─── Configuration (override with environment variables) ─────────────────────
+
+XCODES_DIR="${XCODES_DIRECTORY:-/Applications}"        # where Xcodes live; xcodes reads the same variable
+SYMLINK_PATH="${XCODE_SYMLINK:-$XCODES_DIR/Xcode.app}" # stable path that scripts and CI often hard-code
+MIN_FREE_GB="${MIN_FREE_GB:-40}"                       # the .xip and the extracted app need room at once
+
+# ─── State shared between steps ──────────────────────────────────────────────
+
+DRY_RUN=0         # 1 = print changing commands instead of running them
+AVAILABLE=""      # cached `xcodes list` lines, oldest → newest
+TARGET_VERSION="" # version string xcodes understands, e.g. "27.2" or "27.3 Beta 2"
+TARGET_APP=""     # path of the Xcode the later steps work with
+CHOICE=0          # 1-based answer from the last choose()
+PICKED=""         # value returned by the pick_* helpers
+STEP_TOTAL=0      # > 0 while the wizard runs, so section banners get numbered
+STEP_NO=0
+
+# ─── Output helpers ──────────────────────────────────────────────────────────
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' RED=$'\033[31m' GREEN=$'\033[32m'
+  YELLOW=$'\033[33m' BLUE=$'\033[34m' RESET=$'\033[0m'
+else
+  BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" RESET=""
+fi
+
+info() { printf '%s•%s %s\n' "$BLUE" "$RESET" "$*"; }
+ok() { printf '%s✔%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() {
+  printf '%s✖ %s%s\n' "$RED" "$*" "$RESET" >&2
+  exit 1
+}
+
+# section TITLE — banner at the top of each step ("Step 3/9 · …" inside the wizard).
+section() {
+  local prefix=""
+  if ((STEP_TOTAL > 0)); then
+    STEP_NO=$((STEP_NO + 1))
+    prefix="Step $STEP_NO/$STEP_TOTAL · "
+  fi
+  printf '\n%s━━ %s%s ━━%s\n' "$BOLD" "$prefix" "$1" "$RESET"
+}
+
+# run CMD [ARG...] — show the exact command, then execute it (dry run: show only).
+run() {
+  printf '%s  $ %s%s\n' "$DIM" "$(printf '%q ' "$@")" "$RESET"
+  ((DRY_RUN)) && return 0
+  "$@"
+}
+
+# ─── Prompt helpers ──────────────────────────────────────────────────────────
+
+# read_answer — read one line into $REPLY; exit cleanly on EOF (Ctrl-D / closed stdin).
+read_answer() {
+  REPLY=""
+  read -r REPLY || {
+    printf '\n'
+    die "No input — aborting."
+  }
+}
+
+# confirm QUESTION [y|n] — yes/no question, returns 0 for yes. 2nd arg = Enter default.
+confirm() {
+  local question="$1" default="${2:-y}" hint="[Y/n]"
+  [[ "$default" == n ]] && hint="[y/N]"
+  while true; do
+    printf '%s?%s %s %s ' "$BOLD" "$RESET" "$question" "$hint"
+    read_answer
+    case "${REPLY:-$default}" in
+    [Yy] | [Yy][Ee][Ss]) return 0 ;;
+    [Nn] | [Nn][Oo]) return 1 ;;
+    *) warn "Please answer y or n." ;;
+    esac
+  done
+}
+
+# choose DEFAULT PROMPT OPTION... — numbered menu; stores the 1-based pick in $CHOICE.
+choose() {
+  local default="$1" prompt="$2" option i=1
+  shift 2
+  printf '\n%s%s%s\n' "$BOLD" "$prompt" "$RESET"
+  for option in "$@"; do
+    printf '  %2d) %s\n' "$i" "$option"
+    i=$((i + 1))
+  done
+  while true; do
+    printf 'Choose 1-%d [%d]: ' "$#" "$default"
+    read_answer
+    REPLY="${REPLY:-$default}"
+    # 10# forces base 10 so an answer like "08" isn't read as octal.
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= $#)); then
+      CHOICE=$((10#$REPLY))
+      return 0
+    fi
+    warn "Enter a number from 1 to $#."
+  done
+}
+
+# ─── Read-only lookups ───────────────────────────────────────────────────────
+
+# resolve_dir PATH — physical path with symlinks followed; empty if missing or blank.
+resolve_dir() {
+  [[ -n "$1" ]] || return 0
+  (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+# installed_xcodes — one "label<TAB>path" line per installed Xcode, oldest first.
+#   e.g. "27.2 (27B52) [Apple Silicon]<TAB>/Applications/Xcode-27.2.0.app"
+installed_xcodes() {
+  xcodes installed --directory "$XCODES_DIR" --no-color 2>/dev/null | grep $'\t' || true
+}
+
+# installed_path VERSION — where that version is installed, or nothing.
+installed_path() {
+  local path
+  path="$(xcodes installed "$1" --directory "$XCODES_DIR" --no-color 2>/dev/null | head -n 1)"
+  if [[ "$path" == /* ]]; then printf '%s' "$path"; fi
+}
+
+# selected_app — physical path of the Xcode.app that xcode-select points at.
+#   Resolving matters: if xcode-select uses the /Applications/Xcode.app symlink,
+#   `xcodes installed` can't tell which versioned app is active — this can.
+selected_app() {
+  local dev
+  dev="$(xcode-select -p 2>/dev/null)" || return 0
+  if [[ "$dev" == *.app/Contents/Developer ]]; then resolve_dir "${dev%/Contents/Developer}"; fi
+}
+
+# app_version APP — "Xcode 27.2 (27B52)", read from the bundle's own plists.
+app_version() {
+  if [[ ! -d "$1" ]]; then
+    printf 'Xcode %s' "${TARGET_VERSION:-?}"
+    return
+  fi
+  local version build
+  version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null)"
+  build="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$1/Contents/version.plist" 2>/dev/null)"
+  printf 'Xcode %s (%s)' "${version:-?}" "${build:-?}"
+}
+
+# version_of LABEL — the part xcodes accepts as an argument:
+#   "27.3 Beta 2 (27C5012f) [Apple Silicon]" → "27.3 Beta 2"
+version_of() { printf '%s' "${1%% (*}"; }
+
+# is_prerelease LABEL — true for betas, release candidates and GM seeds.
+is_prerelease() {
+  case "$(version_of "$1")" in
+  *Beta* | *"Release Candidate"* | *GM* | *RC*) return 0 ;;
+  esac
+  return 1
+}
+
+# describe LABEL — short menu text: "27.2 (27B52)" plus an [installed] tag.
+describe() {
+  local text="${1%% \[*}"
+  text="${text% (Installed*}"
+  [[ "$1" == *"(Installed"* ]] && text="$text  ${GREEN}[installed]${RESET}"
+  printf '%s' "$text"
+}
+
+# predict_app_path VERSION — where xcodes will put a version (used only by --dry-run).
+#   xcodes names apps after the semantic version: "27.3 Beta 2" → Xcode-27.3.0-Beta.2.app
+predict_app_path() {
+  local number="${1%% *}" prerelease=""
+  [[ "$1" == *" "* ]] && prerelease="-$(printf '%s' "${1#* }" | tr ' ' '.')"
+  case "$number" in
+  *.*.*) ;;
+  *.*) number="$number.0" ;;
+  *) number="$number.0.0" ;;
+  esac
+  printf '%s/Xcode-%s%s.app' "$XCODES_DIR" "$number" "$prerelease"
+}
+
+# refresh_available — update xcodes' version catalogue and cache it in $AVAILABLE.
+refresh_available() {
+  info "Refreshing the list of available Xcode versions…"
+  xcodes update --directory "$XCODES_DIR" --no-color >/dev/null 2>&1 ||
+    warn "Couldn't refresh the list (offline?) — using the cached copy."
+  AVAILABLE="$(xcodes list --directory "$XCODES_DIR" --no-color 2>/dev/null |
+    grep -E '^[0-9]+(\.[0-9]+)* ' | sort_by_version || true)"
+  [[ -n "$AVAILABLE" ]] || die "xcodes returned no versions — check your network connection."
+}
+
+# sort_by_version — order xcodes labels by version number, oldest → newest.
+#   xcodes lists by release date, so an old-branch update (e.g. "26.6 Release
+#   Candidate") can land after a newer beta. A *stable* numeric sort fixes that
+#   while keeping Beta → Beta 2 → RC → release of one version in their date order.
+sort_by_version() {
+  awk '{ split($1, v, "."); printf "%05d%05d%05d\t%s\n", v[1], v[2], v[3], $0 }' |
+    sort -s -t $'\t' -k1,1 | cut -f2-
+}
+
+# latest_release — newest non-beta label ($AVAILABLE is sorted oldest → newest).
+latest_release() {
+  local line newest=""
+  while IFS= read -r line; do
+    is_prerelease "$line" || newest="$line"
+  done <<<"$AVAILABLE"
+  printf '%s' "$newest"
+}
+
+# latest_prerelease — the newest label, but only if it's a beta/RC newer than every release.
+latest_prerelease() {
+  local newest
+  newest="$(tail -n 1 <<<"$AVAILABLE")"
+  if is_prerelease "$newest"; then printf '%s' "$newest"; fi
+}
+
+# show_status — active Xcode, the stable symlink, and every installed version.
+show_status() {
+  local active label path marker found=0
+  active="$(selected_app)"
+  printf '  %-16s %s\n' "xcode-select:" "$(xcode-select -p 2>/dev/null || echo 'not set')"
+  if [[ -n "$active" ]]; then printf '  %-16s %s\n' "Active Xcode:" "$(app_version "$active") — $active"; fi
+  if [[ -L "$SYMLINK_PATH" ]]; then printf '  %-16s %s\n' "Symlink:" "$SYMLINK_PATH → $(readlink "$SYMLINK_PATH")"; fi
+  printf '\n  Installed in %s:\n' "$XCODES_DIR"
+  while IFS=$'\t' read -r label path; do
+    found=1
+    marker=""
+    [[ "$(resolve_dir "$path")" == "$active" ]] && marker="  ${GREEN}← active${RESET}"
+    printf '    %-34s %s%s\n' "${label% (Selected)}" "$path" "$marker"
+  done < <(installed_xcodes)
+  ((found)) || printf '    (none)\n'
+}
+
+# ─── Pickers ─────────────────────────────────────────────────────────────────
+
+# pick_version — the 15 newest versions (or free text); label/version in $PICKED.
+pick_version() {
+  local labels=() menu=() line
+  while IFS= read -r line; do labels+=("$line"); done < <(tail -n 15 <<<"$AVAILABLE" | tail -r)
+  for line in "${labels[@]}"; do menu+=("$(describe "$line")"); done
+
+  choose 1 "Newest versions first:" "${menu[@]}" "Type a version number…" "Cancel"
+  if ((CHOICE <= ${#labels[@]})); then
+    PICKED="${labels[CHOICE - 1]}"
+  elif ((CHOICE == ${#labels[@]} + 1)); then
+    printf 'Version (e.g. 26.4 or 27.0 Beta 3): '
+    read_answer
+    [[ -n "$REPLY" ]] || return 1
+    PICKED="$REPLY" # xcodes validates it and reports unknown versions itself
+  else
+    return 1
+  fi
+}
+
+# pick_installed PROMPT — menu of installed Xcodes; path in $PICKED, returns 1 on cancel.
+pick_installed() {
+  local labels=() paths=() label path active
+  active="$(selected_app)"
+  while IFS=$'\t' read -r label path; do
+    label="${label% (Selected)}"
+    [[ "$(resolve_dir "$path")" == "$active" ]] && label="$label  ${GREEN}← active${RESET}"
+    labels+=("$label")
+    paths+=("$path")
+  done < <(installed_xcodes)
+
+  if ((${#paths[@]} == 0)); then
+    warn "No Xcode found in $XCODES_DIR."
+    return 1
+  fi
+  choose 1 "$1" "${labels[@]}" "Cancel"
+  ((CHOICE <= ${#paths[@]})) || return 1
+  PICKED="${paths[CHOICE - 1]}"
+}
+
+# pick_runtime — choose a platform, then one of its 12 newest runtimes; name in $PICKED.
+pick_runtime() {
+  local platforms=(iOS watchOS tvOS visionOS) platform names=() menu=() name state
+  choose 1 "Which platform?" "${platforms[@]}"
+  platform="${platforms[CHOICE - 1]}"
+
+  # `xcodes runtimes` repeats a name once per build/architecture: keep one entry
+  # per name (newest first) and remember whether any copy is installed or bundled.
+  while IFS=$'\t' read -r name state; do
+    names+=("$name")
+    menu+=("$name${state:+  ${GREEN}[$state]${RESET}}")
+  done < <(xcodes runtimes --no-color 2>/dev/null | awk -v p="$platform" '
+      index($0, p " ") == 1 {
+        name = $0; sub(/ [[(].*$/, "", name)
+        if (!(name in seen)) { seen[name] = 1; order[++n] = name }
+        if ($0 ~ /\(Installed\)/) state[name] = "installed"
+        else if ($0 ~ /\(Bundled/ && state[name] == "") state[name] = "bundled"
+      }
+      END { for (i = n; i > 0 && i > n - 12; i--) print order[i] "\t" state[order[i]] }')
+
+  if ((${#names[@]} == 0)); then
+    warn "No $platform runtimes found."
+    return 1
+  fi
+  choose 1 "Newest $platform runtimes first:" "${menu[@]}" "Cancel"
+  ((CHOICE <= ${#names[@]})) || return 1
+  PICKED="${names[CHOICE - 1]}"
+}
+
+# ─── Wizard steps ────────────────────────────────────────────────────────────
+
+# ensure_xcodes — the xcodes CLI is required for everything; offer a Homebrew install.
+ensure_xcodes() {
+  command -v xcodes >/dev/null 2>&1 && return 0
+  command -v brew >/dev/null 2>&1 ||
+    die "xcodes isn't installed and Homebrew is missing. See https://github.com/XcodesOrg/xcodes#installation"
+  confirm "xcodes isn't installed. Install it with Homebrew now?" y || die "xcodes is required."
+  run brew install xcodes || die "Couldn't install xcodes."
+  command -v xcodes >/dev/null 2>&1 || die "xcodes still isn't on PATH."
+}
+
+# Step 1 — tools and disk space.
+step_preflight() {
+  section "Preflight checks"
+  ok "xcodes $(xcodes version 2>/dev/null)"
+
+  # Offer to upgrade xcodes itself first; new Xcode releases sometimes need a newer xcodes.
+  if command -v brew >/dev/null 2>&1; then
+    info "Checking Homebrew for a newer xcodes…"
+    if [[ -n "$(brew outdated --quiet xcodes 2>/dev/null)" ]]; then
+      confirm "A newer xcodes is available. Upgrade it first?" y && run brew upgrade xcodes
+    fi
+  fi
+
+  # aria2 is optional: when present, xcodes downloads over 16 connections (3-5x faster).
+  if command -v aria2c >/dev/null 2>&1; then
+    ok "aria2 found — downloads will use up to 16 connections"
+  elif command -v brew >/dev/null 2>&1; then
+    confirm "aria2 isn't installed (makes downloads 3-5x faster). Install it?" y && run brew install aria2
+  fi
+
+  # The .xip and the extracted Xcode exist side by side while installing.
+  local free_space
+  free_space="$(df -g "$XCODES_DIR" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  if [[ "$free_space" =~ ^[0-9]+$ ]] && ((free_space < MIN_FREE_GB)); then
+    warn "Only ${free_space} GB free for $XCODES_DIR (recommended: ${MIN_FREE_GB} GB or more)."
+    confirm "Continue anyway?" n || exit 0
+  else
+    ok "${free_space:-?} GB free for $XCODES_DIR"
+  fi
+}
+
+# Step 2 — refresh the catalogue and show what's on disk.
+step_current_state() {
+  section "Current state"
+  refresh_available
+  show_status
+}
+
+# Step 3 — decide which version to install (or none).
+step_choose_target() {
+  section "Choose a version"
+  local release prerelease
+  release="$(latest_release)"
+  prerelease="$(latest_prerelease)"
+
+  # Build the menu dynamically; `actions` holds what each line means.
+  local options=("Latest release     $(describe "$release")") actions=(release)
+  if [[ -n "$prerelease" ]]; then
+    options+=("Latest beta / RC   $(describe "$prerelease")")
+    actions+=(prerelease)
+  else
+    info "No beta newer than $(version_of "$release") is available right now."
+  fi
+  options+=("Pick another version from the list" "Install nothing — keep using what I have" "Quit")
+  actions+=(pick none quit)
+
+  choose 1 "Which Xcode do you want?" "${options[@]}"
+  TARGET_VERSION="" TARGET_APP=""
+  case "${actions[CHOICE - 1]}" in
+  release) set_target "$release" ;;
+  prerelease) set_target "$prerelease" ;;
+  pick) pick_version && set_target "$PICKED" ;;
+  none) ;;
+  quit) exit 0 ;;
+  esac
+
+  if [[ -z "$TARGET_VERSION" ]]; then
+    info "Nothing will be installed."
+  elif [[ -n "$TARGET_APP" ]]; then
+    ok "Xcode $TARGET_VERSION is already installed at $TARGET_APP"
+  else
+    info "Target: Xcode $TARGET_VERSION"
+  fi
+}
+
+# set_target LABEL — remember the version and, if it's already on disk, where.
+set_target() {
+  TARGET_VERSION="$(version_of "$1")"
+  TARGET_APP="$(installed_path "$TARGET_VERSION")"
+}
+
+# Step 4 — download and install with xcodes, after asking for the options.
+step_install() {
+  section "Install"
+  if [[ -z "$TARGET_VERSION" ]]; then
+    info "Skipped — no version chosen."
+    return 0
+  fi
+  if [[ -n "$TARGET_APP" ]]; then
+    ok "Already installed — no download needed."
+    return 0
+  fi
+
+  local args=(install "$TARGET_VERSION" --directory "$XCODES_DIR")
+  confirm "Use the experimental fast unxip (2-3x quicker extraction)?" y && args+=(--experimental-unxip)
+  confirm "Delete the downloaded .xip afterwards (No = move it to the Trash)?" y && args+=(--empty-trash)
+
+  info "xcodes may ask for your Apple ID + 2FA code (saved to the Keychain afterwards),"
+  info "and for your Mac password to finish setup (license, components, developer mode)."
+  if ! confirm "Download and install Xcode $TARGET_VERSION now?" y; then
+    warn "Install skipped."
+    TARGET_VERSION=""
+    return 0
+  fi
+
+  # --select is deliberately NOT passed: step 5 lets you decide how (and whether)
+  # the new Xcode becomes the default.
+  if run xcodes "${args[@]}"; then
+    if ((DRY_RUN)); then
+      TARGET_APP="$(predict_app_path "$TARGET_VERSION")"
+      info "Would be installed at $TARGET_APP"
+    else
+      TARGET_APP="$(installed_path "$TARGET_VERSION")"
+      ok "Xcode $TARGET_VERSION installed at ${TARGET_APP:-$XCODES_DIR}"
+    fi
+  else
+    warn "xcodes install failed — see its output above."
+    confirm "Continue with the remaining steps anyway?" n || exit 1
+    TARGET_VERSION="" TARGET_APP=""
+  fi
+}
+
+# Step 5 — make an Xcode the system-wide default.
+#   xcode-select writes /var/db/xcode_select_link, which every /usr/bin developer
+#   tool (xcodebuild, clang, swift, git…) follows — hence "system-wide" and sudo.
+#   DEVELOPER_DIR, if set in a shell, still overrides it for that shell only.
+step_make_default() {
+  section "Make it the system-wide default"
+  if [[ -z "$TARGET_APP" ]]; then
+    pick_installed "Which installed Xcode should be the default?" || {
+      info "Default left unchanged."
+      return 0
+    }
+    TARGET_APP="$PICKED"
+  fi
+
+  local app="$TARGET_APP" active
+  active="$(selected_app)"
+  if [[ -n "$active" && "$(resolve_dir "$app")" == "$active" ]]; then
+    ok "$(app_version "$app") is already the active Xcode."
+    return 0
+  fi
+  info "Active now: ${active:-none}"
+
+  # Offer the stable-symlink layout unless a real app already sits at that path.
+  local options=() actions=() verb="Create"
+  if [[ -L "$SYMLINK_PATH" || ! -e "$SYMLINK_PATH" ]]; then
+    [[ -L "$SYMLINK_PATH" ]] && verb="Repoint"
+    options+=("$verb $SYMLINK_PATH → $(basename "$app") and select it (stable path for scripts/CI)")
+    actions+=(symlink)
+  else
+    info "$SYMLINK_PATH is a real app, not a symlink — it won't be touched."
+  fi
+  options+=("Select $app directly" "Keep the current default")
+  actions+=(direct keep)
+
+  choose 1 "How should it become the default?" "${options[@]}"
+  case "${actions[CHOICE - 1]}" in
+  # -n: replace the existing link itself instead of creating a link inside the old app.
+  symlink) run sudo ln -sfn "$app" "$SYMLINK_PATH" && run sudo xcode-select --switch "$SYMLINK_PATH" ;;
+  direct) run sudo xcode-select --switch "$app" ;;
+  keep)
+    info "Default left unchanged."
+    return 0
+    ;;
+  esac
+  ((DRY_RUN)) || ok "xcode-select now points at $(xcode-select -p)"
+}
+
+# Step 6 — license + first-launch packages (xcodes usually did this already).
+step_first_launch() {
+  section "First-launch setup"
+  local app="${TARGET_APP:-$(selected_app)}"
+  if [[ -z "$app" ]]; then
+    info "Skipped — no Xcode selected."
+    return 0
+  fi
+
+  # Call this Xcode's own xcodebuild so the check targets it even if it isn't selected.
+  local xcodebuild_bin="$app/Contents/Developer/usr/bin/xcodebuild"
+  if [[ -x "$xcodebuild_bin" ]] &&
+    "$xcodebuild_bin" -license check >/dev/null 2>&1 &&
+    "$xcodebuild_bin" -checkFirstLaunchStatus >/dev/null 2>&1; then
+    ok "License accepted and system components installed — nothing to do."
+    return 0
+  fi
+
+  if confirm "Accept the Xcode license and install required system components now?" y; then
+    run sudo "$xcodebuild_bin" -runFirstLaunch
+  else
+    warn "Skipped — Xcode will ask for this on its first launch."
+  fi
+}
+
+# Step 7 — offer to uninstall every Xcode except the active one and the new one.
+step_cleanup() {
+  section "Remove old Xcode versions"
+  local keep_new keep_active link_target label path real i
+  keep_new="$(resolve_dir "$TARGET_APP")"
+  keep_active="$(selected_app)"
+  link_target=""
+  [[ -L "$SYMLINK_PATH" ]] && link_target="$(resolve_dir "$SYMLINK_PATH")"
+
+  # Collect candidates; parallel arrays because bash 3.2 has no structs/maps.
+  local labels=() versions=() paths=() reals=()
+  while IFS=$'\t' read -r label path; do
+    real="$(resolve_dir "$path")"
+    if [[ -n "$real" && ("$real" == "$keep_new" || "$real" == "$keep_active") ]]; then continue; fi
+    labels+=("${label% (Selected)}")
+    versions+=("$(version_of "$label")")
+    paths+=("$path")
+    reals+=("$real")
+  done < <(installed_xcodes)
+
+  if ((${#paths[@]} == 0)); then
+    ok "Nothing to clean up — no other Xcode versions are installed."
+    return 0
+  fi
+
+  info "Other installed versions (the active and newly installed Xcodes are never offered):"
+  for i in "${!paths[@]}"; do
+    printf '    %-34s %6s  %s\n' "${labels[i]}" "$(du -sh "${paths[i]}" 2>/dev/null | cut -f1)" "${paths[i]}"
+  done
+
+  choose 3 "What should happen to them?" \
+    "Uninstall all of them" \
+    "Ask me about each one" \
+    "Keep them all — just use the new version"
+  local mode=$CHOICE
+  if ((mode == 3)); then
+    info "Keeping all versions."
+    return 0
+  fi
+
+  local permanently=0 broke_link=0 args
+  confirm "Delete permanently? (No = move to the Trash, restorable until you empty it)" n && permanently=1
+
+  for i in "${!paths[@]}"; do
+    if ((mode == 2)) && ! confirm "Uninstall ${labels[i]}?" n; then continue; fi
+    args=(uninstall "${versions[i]}" --directory "$XCODES_DIR")
+    ((permanently)) && args+=(--empty-trash)
+    if run xcodes "${args[@]}"; then
+      [[ -n "$link_target" && "${reals[i]}" == "$link_target" ]] && broke_link=1
+    else
+      warn "Couldn't uninstall ${labels[i]}."
+    fi
+  done
+  ((permanently)) || info "Removed Xcodes are in the Trash — empty it to get the space back."
+
+  # Removing the version the stable symlink pointed at leaves it dangling; fix it.
+  if ((broke_link)); then
+    warn "$SYMLINK_PATH pointed at a version you just removed."
+    local active
+    active="$(selected_app)"
+    if [[ -n "$active" ]] && confirm "Repoint it at the active Xcode ($(basename "$active"))?" y; then
+      run sudo ln -sfn "$active" "$SYMLINK_PATH"
+    elif confirm "Remove the broken symlink instead?" y; then
+      run sudo rm "$SYMLINK_PATH"
+    fi
+  fi
+}
+
+# Step 8 — simulator runtimes (shipped separately from Xcode since Xcode 15).
+step_runtimes() {
+  section "Simulator runtimes"
+  local app="${TARGET_APP:-$(selected_app)}" xcodebuild_bin="xcodebuild" label="the active Xcode"
+  # This Xcode's own xcodebuild downloads the runtime version that matches *it*,
+  # even when it isn't the selected Xcode yet. No Apple ID needed.
+  if [[ -n "$app" ]]; then
+    xcodebuild_bin="$app/Contents/Developer/usr/bin/xcodebuild"
+    label="$(app_version "$app")"
+  fi
+
+  info "Installed runtime disk images:"
+  xcrun simctl runtime list 2>/dev/null | sed -e '/^$/d' -e 's/^/    /'
+
+  local other_platforms=(watchOS tvOS visionOS)
+  while true; do
+    choose 5 "Runtimes — what would you like to do?" \
+      "Download the iOS simulator for $label" \
+      "Download another platform for $label (watchOS / tvOS / visionOS)" \
+      "Install a specific runtime version with xcodes (e.g. an older iOS)" \
+      "Delete outdated runtimes (shows a preview first)" \
+      "Done"
+    case $CHOICE in
+    1) run "$xcodebuild_bin" -downloadPlatform iOS ;;
+    2)
+      choose 1 "Which platform?" "${other_platforms[@]}"
+      run "$xcodebuild_bin" -downloadPlatform "${other_platforms[CHOICE - 1]}"
+      ;;
+    3) pick_runtime && run xcodes runtimes install "$PICKED" ;;
+    4) delete_outdated_runtimes ;;
+    *) return 0 ;;
+    esac
+  done
+}
+
+# delete_outdated_runtimes — remove runtimes superseded by a newer build of the same OS.
+delete_outdated_runtimes() {
+  local preview
+  preview="$(xcrun simctl runtime delete --outdated --dry-run 2>&1)"
+  if [[ -z "$preview" || "$preview" == *"No matching"* ]]; then
+    ok "No outdated runtimes to delete."
+    return 0
+  fi
+  printf '%s\n' "$preview" | sed 's/^/    /'
+  confirm "Delete these runtimes?" n && run xcrun simctl runtime delete --outdated
+}
+
+# Step 9 — final state.
+step_summary() {
+  section "Summary"
+  show_status
+  printf '\n'
+  xcodebuild -version 2>/dev/null | sed 's/^/  /'
+  ((DRY_RUN)) && warn "Dry run — nothing was changed."
+  ok "All done."
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+# update — the full wizard; every step runs in order and asks before acting.
+cmd_update() {
+  printf '\n%sXcode update wizard%s — each step asks before it changes anything.\n' "$BOLD" "$RESET"
+  printf '  1 Preflight · 2 Current state · 3 Choose version · 4 Install · 5 Make default\n'
+  printf '  6 First launch · 7 Remove old versions · 8 Simulator runtimes · 9 Summary\n'
+  confirm "Start?" y || return 0
+
+  STEP_TOTAL=9 STEP_NO=0
+  step_preflight
+  step_current_state
+  step_choose_target
+  step_install
+  step_make_default
+  step_first_launch
+  step_cleanup
+  step_runtimes
+  step_summary
+  STEP_TOTAL=0
+}
+
+cmd_switch() {
+  TARGET_APP=""
+  step_make_default
+  step_first_launch # a never-launched Xcode may still need its license accepted
+}
+
+cmd_cleanup() {
+  TARGET_APP=""
+  step_cleanup
+}
+
+cmd_runtimes() {
+  TARGET_APP=""
+  step_runtimes
+}
+
+cmd_status() {
+  section "Status"
+  show_status
+}
+
+cmd_signout() {
+  if confirm "Forget the Apple ID and password that xcodes saved in the Keychain?" n; then
+    run xcodes signout
+  fi
+}
+
+# menu — shown when the script runs without a command.
+cmd_menu() {
+  while true; do
+    choose 1 "Xcode updater — what would you like to do?" \
+      "Update wizard — install the newest Xcode step by step" \
+      "Switch the active Xcode" \
+      "Uninstall old Xcode versions" \
+      "Simulator runtimes" \
+      "Show status" \
+      "Sign out of the Apple ID saved by xcodes" \
+      "Quit"
+    case $CHOICE in
+    1)
+      cmd_update
+      return 0
+      ;;
+    2) cmd_switch ;;
+    3) cmd_cleanup ;;
+    4) cmd_runtimes ;;
+    5) cmd_status ;;
+    6) cmd_signout ;;
+    *) return 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+Usage: xcode-update [command] [--dry-run]
+
+Interactive, step-by-step Xcode updater built on xcodes. Nothing is installed,
+switched or removed without asking you first.
+
+Commands:
+  (none)      open the main menu
+  update      run the full update wizard
+  switch      choose which installed Xcode is the system-wide default
+  cleanup     uninstall old Xcode versions
+  runtimes    download or delete simulator runtimes
+  status      show installed Xcodes and the active one
+  signout     forget the Apple ID saved by xcodes
+
+Options:
+  -n, --dry-run   print every command that would change something; run none of them
+  -h, --help      show this help
+  -V, --version   print the script version
+
+Environment:
+  XCODES_DIRECTORY   where Xcodes are installed (default: /Applications)
+  XCODE_SYMLINK      stable symlink path (default: \$XCODES_DIRECTORY/Xcode.app)
+  MIN_FREE_GB        free-space warning threshold in GB (default: 40)
+  XCODES_USERNAME / XCODES_PASSWORD   Apple ID for xcodes (otherwise it prompts)
+EOF
+}
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+
+main() {
+  local command="menu" arg
+  for arg in "$@"; do
+    case "$arg" in
+    -n | --dry-run) DRY_RUN=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -V | --version)
+      printf 'xcode-update %s\n' "$SCRIPT_VERSION"
+      exit 0
+      ;;
+    menu | update | switch | cleanup | runtimes | status | signout) command="$arg" ;;
+    *)
+      usage >&2
+      die "Unknown argument: $arg"
+      ;;
+    esac
+  done
+
+  [[ "$(uname -s)" == Darwin ]] || die "xcode-update only runs on macOS."
+  # Real runs need a terminal: xcodes prompts for the Apple ID / 2FA and sudo for a password.
+  [[ -t 0 ]] || ((DRY_RUN)) || die "This wizard is interactive — run it from a terminal."
+  trap 'printf "\n"; warn "Interrupted — steps that already finished are kept."; exit 130' INT
+
+  ((DRY_RUN)) && warn "DRY RUN — changing commands are printed, not executed."
+  ensure_xcodes
+
+  case "$command" in
+  menu) cmd_menu ;;
+  update) cmd_update ;;
+  switch) cmd_switch ;;
+  cleanup) cmd_cleanup ;;
+  runtimes) cmd_runtimes ;;
+  status) cmd_status ;;
+  signout) cmd_signout ;;
+  esac
+}
+
+main "$@"
